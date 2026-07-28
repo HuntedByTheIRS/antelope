@@ -13,6 +13,7 @@ struct Environment
 {
     private string[string] vars;
     private bool[string] exported;
+    private bool[string] cmdOverride;  // set by command-line VAR=value
     private ScopedVariable[] scopedVars;
 
     /// Get a variable value.
@@ -29,9 +30,22 @@ struct Environment
         return vars.keys;
     }
 
-    /// Set a variable value.
+    /// Set a variable value (Makefile or environment).
+    /// Command-line overrides are NOT overwritten by this method.
     void set(string key, string value)
     {
+        // Command-line overrides have highest precedence —
+        // only `override` directive can change them (not yet implemented).
+        if (key in cmdOverride)
+            return;
+        vars[key] = value;
+    }
+
+    /// Set a command-line variable override (VAR=value on CLI).
+    /// These take precedence over all Makefile assignments.
+    void setCmdOverride(string key, string value)
+    {
+        cmdOverride[key] = true;
         vars[key] = value;
     }
 

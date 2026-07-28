@@ -568,6 +568,36 @@ string evaluateFunction(BuiltinFunction func, string[] args, Environment* env = 
             if (args.length < 1)
                 return "undefined";
             return env && env.hasKey(args[0]) ? "recursive" : "undefined";
+
+        // --- Logical operators ---
+        case BuiltinFunction.or_:
+            // $(or arg1,arg2,...) — returns the first non-empty argument.
+            // Short-circuit: arguments are not expanded until needed.
+            foreach (arg; args)
+            {
+                // For self-expanding functions, args are raw — expand now.
+                import antelope.evaluator.expansion;
+                string expanded = expand(arg, env);
+                if (expanded.length > 0)
+                    return expanded;
+            }
+            return "";
+
+        case BuiltinFunction.and_:
+            // $(and arg1,arg2,...) — returns empty if any argument is empty,
+            // otherwise returns the last (expanded) argument.
+            {
+                import antelope.evaluator.expansion;
+                string last;
+                foreach (arg; args)
+                {
+                    string expanded = expand(arg, env);
+                    if (expanded.length == 0)
+                        return "";
+                    last = expanded;
+                }
+                return last;
+            }
     }
 }
 

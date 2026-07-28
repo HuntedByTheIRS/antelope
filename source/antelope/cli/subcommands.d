@@ -117,6 +117,35 @@ int runBuild(CliConfig config)
         env.set("MAKECMDGOALS", config.targets.join(" "));
     }
 
+    // Parse MAKEFLAGS for variable overrides propagated from parent
+    // antelope processes via recursive $(MAKE).  These are serialized
+    // in MAKEFLAGS as "VAR=value" tokens.
+    if (env.hasKey("MAKEFLAGS"))
+    {
+        import std.string : split, indexOf;
+        import std.algorithm : startsWith;
+        auto mkFlags = env.get("MAKEFLAGS");
+        foreach (word; mkFlags.split(" "))
+        {
+            auto eqPos = indexOf(word, '=');
+            if (eqPos > 0 && !word.startsWith("-"))
+            {
+                string varName = word[0 .. eqPos];
+                string varValue = word[eqPos + 1 .. $];
+                config.varOverrides[varName] = varValue;
+            }
+        }
+    }
+
+    // Apply command-line variable overrides (VAR=value args) BEFORE
+    // Makefile evaluation so they take precedence over Makefile
+    // assignments.  GNU Make semantics: command-line vars beat
+    // everything except `override` directives.
+    foreach (varName, varValue; config.varOverrides)
+    {
+        env.setCmdOverride(varName, varValue);
+    }
+
     // Evaluate AST → populate env + build graph
     auto graph = new DependencyGraph();
 
@@ -229,9 +258,26 @@ int runBuild(CliConfig config)
     {
         if (!graph.hasTarget(targetName))
         {
-            log(LogLevel.normal, "antelope: *** No rule to make target '" ~
-                targetName ~ "'.  Stop.");
-            return 1;
+            // Target not explicitly defined — try to create it from
+            // implicit rules (suffix rules, pattern rules).  Autotools
+            // Makefiles invoke $(MAKE) with targets like "be.gmo" that
+            // are only defined via suffix rules (e.g., .po.gmo:).
+            import antelope.build.target;
+            Target stub;
+            stub.name = targetName;
+            stub.kind = TargetKind.file;
+            graph.addTarget(stub);
+
+            import antelope.evaluator.evaluator : resolveImplicitRules;
+            resolveImplicitRules(*graph, env);
+
+            if (!graph.hasTarget(targetName) ||
+                graph.findTarget(targetName).recipe.length == 0)
+            {
+                log(LogLevel.normal, "antelope: *** No rule to make target '" ~
+                    targetName ~ "'.  Stop.");
+                return 1;
+            }
         }
 
         // Resolve dependencies and check what needs building
@@ -263,7 +309,7 @@ int runBuild(CliConfig config)
                 {
                     // Expand variables in the recipe
                     string expanded = expand(recipeLine, env, t.name,
-                        t.prerequisites);
+                        t.prerequisites, t.stem);
 
                     // Print the command unless silent (@ prefix)
                     import std.string : stripLeft;

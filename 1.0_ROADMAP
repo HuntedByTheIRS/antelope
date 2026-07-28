@@ -1,0 +1,12 @@
+0.0  musl              ✓
+0.1  dwm               ✓
+0.2  Make itself       ✓
+0.3  Git
+0.4  BusyBox
+0.5  Binutils
+0.6  QEMU
+0.7  GDC
+0.8  Linux kernel
+0.9  OpenSSH
+0.9.x Coreutils
+1.0  GCC

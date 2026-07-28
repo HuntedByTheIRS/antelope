@@ -40,11 +40,17 @@ struct SubMakeConfig
 ///   -n       — dry run
 ///   -P       — POSIX conformance mode
 ///   -d       — debug output
+///   VAR=val  — command-line variable overrides
 ///
 /// Returns: a space-delimited MAKEFLAGS string, or "" if no flags are active.
 string serializeMakeFlags(CliConfig config)
 {
     string flags;
+
+    // Variable overrides first (parsed back by parseArgs in sub-make)
+    foreach (varName, varValue; config.varOverrides)
+        flags ~= " " ~ varName ~ "=" ~ varValue;
+
     if (config.jobs > 1)
         flags ~= " -j" ~ config.jobs.to!string;
     if (config.dryRun)

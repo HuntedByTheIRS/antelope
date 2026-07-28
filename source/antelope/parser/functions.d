@@ -35,6 +35,8 @@ enum BuiltinFunction
     value,
     origin,
     flavor,
+    or_,
+    and_,
 }
 
 /// A parsed function call.

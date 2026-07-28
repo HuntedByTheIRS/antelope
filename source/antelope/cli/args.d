@@ -6,7 +6,7 @@ module antelope.cli.args;
 
 import std.algorithm.searching : startsWith;
 import std.conv : to;
-import std.string : strip;
+import std.string : strip, indexOf;
 import std.ascii : isDigit;
 
 /// Available subcommands.
@@ -54,6 +54,10 @@ struct CliConfig
 
     /// Show version (--version).
     bool showVersion;
+
+    /// Variable overrides from the command line (VAR=value style).
+    /// GNU Make passes these with highest precedence.
+    string[string] varOverrides;
 }
 
 // --- Helpers ---
@@ -226,6 +230,16 @@ CliConfig parseArgs(string[] args)
         // Unknown flags → silently ignore (GNU Make compatibility)
         if (arg.startsWith("-"))
         {
+            continue;
+        }
+
+        // Variable override: VAR=value (GNU Make command-line var)
+        auto eqPos = indexOf(arg, '=');
+        if (eqPos > 0)
+        {
+            string varName = arg[0 .. eqPos];
+            string varValue = arg[eqPos + 1 .. $];
+            config.varOverrides[varName] = varValue;
             continue;
         }
 

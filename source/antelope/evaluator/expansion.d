@@ -770,6 +770,7 @@ bool isBuiltinFunction(string word)
         case "wildcard": case "realpath": case "abspath":
         case "shell": case "error": case "warning": case "info":
         case "foreach": case "call": case "value": case "origin": case "flavor":
+        case "or": case "and":
             return true;
         default:
             return false;
@@ -835,6 +836,8 @@ private bool isSelfExpanding(BuiltinFunction bf)
     switch (bf)
     {
         case BuiltinFunction.foreach_:
+        case BuiltinFunction.or_:
+        case BuiltinFunction.and_:
             return true;
         default:
             return false;
@@ -878,6 +881,8 @@ BuiltinFunction builtinFromName(string name)
         case "value":      return BuiltinFunction.value;
         case "origin":     return BuiltinFunction.origin;
         case "flavor":     return BuiltinFunction.flavor;
+        case "or":         return BuiltinFunction.or_;
+        case "and":        return BuiltinFunction.and_;
         default:           return BuiltinFunction.info;
     }
 }

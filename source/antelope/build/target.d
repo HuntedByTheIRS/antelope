@@ -17,4 +17,5 @@ struct Target
     string[] prerequisites;        /// Normal prerequisites (trigger rebuild)
     string[] recipe;               /// Shell commands to build this target
     string[] orderOnlyPrereqs;     /// Order-only prerequisites (| — must exist, no rebuild trigger)
+    string stem;                   /// Pattern/suffix rule stem for $* expansion
 }

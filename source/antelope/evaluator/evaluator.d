@@ -129,6 +129,7 @@ size_t resolveImplicitRules(ref DependencyGraph graph, Environment* env = null)
             if (prereqSatisfiable(match.resolvedPrereq, graph))
             {
                 tp.recipe = match.rule.recipe;
+                tp.stem = match.stem;  // for $* expansion in recipes
                 if (match.resolvedPrereq.length > 0)
                 {
                     bool alreadyPresent;
@@ -171,9 +172,100 @@ size_t resolveImplicitRules(ref DependencyGraph graph, Environment* env = null)
             if (userMatches.length > 0)
             {
                 auto um = userMatches[$ - 1];
-                resolveUserPatternRule(tp, um, graph, env);
-                resolved++;
-                applied = true;
+                // Skip pattern rules with no recipe — GNU Make treats these
+                // as "cancellation" rules that remove implicit rules rather
+                // than providing new ones.  Applying an empty recipe would
+                // leave the target unresolved (recipe.length==0), causing
+                // infinite re-resolution every pass.
+                if (um.rule.recipe.length > 0)
+                {
+                    resolveUserPatternRule(tp, um, graph, env);
+                    resolved++;
+                    applied = true;
+                }
+            }
+
+            // If still no match, try suffix rules (e.g., .c.o:).
+            // GNU Make suffix rules provide recipes for targets based on
+            // the file extensions of the target and its prerequisites.
+            if (!applied)
+            {
+                import std.string : lastIndexOf;
+                import std.file : exists;
+                auto tDot = lastIndexOf(tp.name, '.');
+                if (tDot >= 0)
+                {
+                    string tSuffix = tp.name[tDot .. $];  // e.g. ".o"
+
+                    // First pass: match against existing prerequisites.
+                    if (tp.prerequisites.length > 0)
+                    {
+                        foreach (prereq; tp.prerequisites)
+                        {
+                            auto pDot = lastIndexOf(prereq, '.');
+                            if (pDot >= 0)
+                            {
+                                string pSuffix = prereq[pDot .. $];
+                                string ruleName = pSuffix ~ tSuffix;
+                                auto sr = graph.findTarget(ruleName);
+                                // Only apply if the source prerequisite actually
+                                // exists on disk (matching GNU Make semantics).
+                                if (sr !is null && sr.recipe.length > 0 && exists(prereq))
+                                {
+                                    tp.recipe = sr.recipe;
+                                    // Stem for $*: everything before the target suffix
+                                    tp.stem = tp.name[0 .. tDot];
+                                    resolved++;
+                                    applied = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    // Second pass: no existing prereqs — try to discover
+                    // a source file by matching suffix rules.  For target
+                    // "be.gmo", find suffix rules ending in ".gmo" (e.g.,
+                    // ".po.gmo"), construct the source name "be.po", and
+                    // check if it exists on disk.
+                    if (!applied)
+                    {
+                        string stem = tp.name[0 .. tDot];  // e.g. "be"
+                        // Scan all graph targets for suffix rules matching tSuffix
+                        foreach (ref gt; graph.targets)
+                        {
+                            if (gt.name.length > tSuffix.length &&
+                                gt.name[$ - tSuffix.length .. $] == tSuffix &&
+                                gt.name[0] == '.')
+                            {
+                                // gt.name is e.g. ".po.gmo" — source suffix is
+                                // everything before tSuffix: ".po"
+                                string srcSuffix = gt.name[0 .. $ - tSuffix.length];
+                                if (srcSuffix.length == 0 || srcSuffix[0] != '.')
+                                    continue;
+                                string srcFile = stem ~ srcSuffix;  // e.g. "be.po"
+                                if (exists(srcFile) && gt.recipe.length > 0)
+                                {
+                                    tp.recipe = gt.recipe;
+                                    tp.stem = stem;  // for $* expansion
+                                    // Add source as a prerequisite
+                                    bool alreadyPresent;
+                                    foreach (p; tp.prerequisites)
+                                        if (p == srcFile) { alreadyPresent = true; break; }
+                                    if (!alreadyPresent)
+                                    {
+                                        string[] np = [srcFile];
+                                        np ~= tp.prerequisites;
+                                        tp.prerequisites = np;
+                                    }
+                                    resolved++;
+                                    applied = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 
@@ -193,6 +285,7 @@ private void resolveUserPatternRule(Target* tp, PatternMatch match,
                                     ref DependencyGraph graph, Environment* env)
 {
     tp.recipe = match.rule.recipe;
+    tp.stem = match.stem;  // for $* expansion in recipes
     // Clear existing prereqs and set from pattern match
     tp.prerequisites = [];
     foreach (prereq; match.resolvedPrereqs)
@@ -337,7 +430,11 @@ private void handleRule(AstNode node, Environment* env, DependencyGraph* graph)
         foreach (ref p; prereqs)
         {
             string expanded = expand(p, env);
-            foreach (word; expanded.split(" "))
+            // Split on ALL whitespace (not just spaces).  Autotools
+            // Makefiles use tab-indented line continuations inside
+            // variable values, so a naive space-split leaves leading
+            // tabs that prevent prerequisite names from matching.
+            foreach (word; expanded.split())
             {
                 if (word.length > 0)
                     expandedPrereqs ~= word;
@@ -387,12 +484,35 @@ private void handleRule(AstNode node, Environment* env, DependencyGraph* graph)
     t.orderOnlyPrereqs = prereqSplit.orderOnly;
     t.recipe = recipe;
 
+    // Materialize missing prerequisites as stub Targets in the graph.
+    // Without this, prerequisites that have no explicit rule (e.g., foo.o
+    // when only "all: foo.o" appears) never become graph targets, so
+    // resolveImplicitRules() can't give them recipes and the dependency
+    // resolver treats them as external/always-satisfied.
+    // Skip pattern prereqs containing '%' — they're templates, not real files.
+    if (graph)
+    {
+        import std.file : exists;
+        import std.string : indexOf;
+        foreach (prereq; prereqSplit.normal ~ prereqSplit.orderOnly)
+        {
+            if (indexOf(prereq, '%') >= 0) continue;  // pattern prereq, not a real file
+            if (!graph.hasTarget(prereq) && !exists(prereq))
+            {
+                Target stub;
+                stub.name = prereq;
+                stub.kind = TargetKind.file;
+                graph.addTarget(stub);
+            }
+        }
+    }
+
     // Handle multi-target rules: when target expands to multiple words,
     // create separate targets for each (same prereqs + recipe).
     import std.string;
     import std.algorithm : filter;
     import std.array : array;
-    auto expandedTargets = targetName.split(" ").filter!(s => s.length > 0).array;
+    auto expandedTargets = targetName.split().filter!(s => s.length > 0).array;
     if (expandedTargets.length > 1)
     {
         foreach (tn; expandedTargets)
@@ -561,7 +681,7 @@ private void handleDirective(AstNode node, Environment* env, DependencyGraph* gr
             import std.string : split;
             VPathEntry entry;
             entry.pattern = pattern;
-            foreach (dir; dirs.split(" "))
+            foreach (dir; dirs.split())
                 if (dir.length > 0) entry.directories ~= dir;
             // Store in env for later use by the resolver
             if (env !is null)
@@ -667,14 +787,21 @@ private void handleInclude(string dirName, string data, ptrdiff_t space,
 {
     if (space < 0) return;
 
-    string rawPath = data[space + 1 .. $].strip;
+    string rawPath = data[space + 1 .. $];
+    // Strip inline comment (# to end of logical line).
+    // Autotools-generated Makefiles append " # am--include-marker"
+    // as a comment after include directives.
+    auto hashPos = indexOf(rawPath, '#');
+    if (hashPos >= 0)
+        rawPath = rawPath[0 .. hashPos];
+    rawPath = rawPath.strip;
     if (rawPath.length == 0) return;
 
     // Expand variable references in the include path (e.g., $(DEP_FILES)
     // commonly expands to "./.deps/a.Po ./.deps/b.Po" in autotools projects).
     import antelope.evaluator.expansion;
     import std.string : split;
-    auto paths = expand(rawPath, env).split(" ");
+    auto paths = expand(rawPath, env).split();
 
     foreach (path; paths)
     {
@@ -812,20 +939,23 @@ unittest
 
     evaluate(root, &env, &graph);
 
-    assert(graph.targets.length == 1,
-           "graph should contain exactly 1 target");
-    assert(graph.targets[0].name == "program",
-           "target name should be 'program', got: " ~ graph.targets[0].name);
-    assert(graph.targets[0].prerequisites.length == 2,
+    // With prerequisite materialization, main.o + util.o become stub targets
+    assert(graph.targets.length == 3,
+           "graph should contain program + 2 prereq stubs");
+    auto prog = graph.findTarget("program");
+    assert(prog !is null, "program should be in the graph");
+    assert(prog.name == "program",
+           "target name should be 'program', got: " ~ prog.name);
+    assert(prog.prerequisites.length == 2,
            "target should have 2 prerequisites, got: " ~
-           to!string(graph.targets[0].prerequisites.length));
-    assert(graph.targets[0].prerequisites[0] == "main.o",
+           to!string(prog.prerequisites.length));
+    assert(prog.prerequisites[0] == "main.o",
            "first prereq should be 'main.o', got: " ~
-           graph.targets[0].prerequisites[0]);
-    assert(graph.targets[0].prerequisites[1] == "util.o",
+           prog.prerequisites[0]);
+    assert(prog.prerequisites[1] == "util.o",
            "second prereq should be 'util.o', got: " ~
-           graph.targets[0].prerequisites[1]);
-    assert(graph.targets[0].recipe.length == 1,
+           prog.prerequisites[1]);
+    assert(prog.recipe.length == 1,
            "target should have 1 recipe line");
 }
 
@@ -1130,9 +1260,11 @@ unittest
 
     assert(env.get("CC") == "gcc");
     assert(env.get("CFLAGS") == "-Wall");
-    assert(graph.targets.length == 2);
-    assert(graph.targets[0].name == "foo.o");
-    assert(graph.targets[1].name == "bar.o");
+    // foo.o: foo.c → foo.c stub, bar.o: → no prereqs
+    assert(graph.targets.length == 3);
+    assert(graph.hasTarget("foo.o"), "foo.o should be in graph");
+    assert(graph.hasTarget("bar.o"), "bar.o should be in graph");
+    assert(graph.hasTarget("foo.c"), "foo.c stub should be in graph");
 }
 
 ///
@@ -1395,13 +1527,15 @@ unittest
     evaluate(root, &env, &graph);
 
     // Target should exist with only real prereqs.
-    // Target should exist with only real prereqs.
-    assert(graph.targets.length == 1);
-    assert(graph.targets[0].prerequisites.length == 2,
+    // dep1.o + dep2.o stubs also materialized.
+    assert(graph.targets.length == 3);
+    auto myprog = graph.findTarget("my_prog");
+    assert(myprog !is null);
+    assert(myprog.prerequisites.length == 2,
            "should have 2 real prereqs, got: " ~
-           graph.targets[0].prerequisites.length.to!string);
-    assert(graph.targets[0].prerequisites[0] == "dep1.o");
-    assert(graph.targets[0].prerequisites[1] == "dep2.o");
+           myprog.prerequisites.length.to!string);
+    assert(myprog.prerequisites[0] == "dep1.o");
+    assert(myprog.prerequisites[1] == "dep2.o");
 
     // Scoped variable should be stored.
     assert(env.getScoped("LDFLAGS", "my_prog") == "-lm",

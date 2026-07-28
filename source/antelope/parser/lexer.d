@@ -41,12 +41,20 @@ struct Token
 }
 
 /// Returns true if `c` is a valid character inside an identifier.
+///
+/// GNU Make identifiers are extremely permissive — almost any printable
+/// character that isn't a whitespace or operator can appear in variable
+/// names, values, and prerequisite names.  Missing any character here
+/// causes an infinite loop in the lexer (the identifier-accumulation
+/// code breaks without advancing `pos`, so nextToken() returns the same
+/// empty-token forever).
 private static bool isIdentChar(char c)
 {
     import std.ascii : isAlphaNum;
     switch (c)
     {
-        case '-', '_', '.', '/', '+', '?', '%', '*', '~', '\\', '@', '<', '^':
+        case '-', '_', '.', '/', '+', '?', '%', '*', '~', '\\', '@', '<', '^',
+             '\'', '"', '`', '!', '&', '[', ']':
             return true;
         default:
             return isAlphaNum(c);
@@ -272,6 +280,17 @@ struct Lexer
             }
 
             break;
+        }
+
+        // Safety net: if nothing was accumulated (the first character isn't
+        // a valid identifier char and we broke immediately), eat the
+        // unrecognised byte and return it as a single-char identifier.
+        // Without this, the lexer loops forever because `pos` never advances.
+        if (buf.length == 0 && pos < input.length)
+        {
+            buf ~= input[pos];
+            pos++;
+            column++;
         }
 
         string value = buf.idup;

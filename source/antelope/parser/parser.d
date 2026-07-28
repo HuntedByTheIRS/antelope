@@ -474,19 +474,32 @@ private struct Parser
                 prereq.data = accumulatePrereq();
                 // Merge adjacent tokens into a single prerequisite
                 // when the first token was a $ reference, but stop
-                // at standalone $ refs like $(OBJS) ${LIBS}
+                // at standalone $ refs like $(OBJS) ${LIBS}.
+                // Also stop if identifier text has been merged after
+                // the initial $() — a subsequent $ is a new independent
+                // reference (e.g., "$(srcdir)/foo $(BAR)" should be two
+                // prereqs, not one concatenation).
                 bool startsWithDollar = (prereq.data.length > 0 && prereq.data[0] == '$');
                 if (startsWithDollar)
                 {
+                    bool mergedIdents;
                     while (check(TokenType.identifier) || check(TokenType.dollar))
                     {
                         // Don't merge separate standalone $ refs
                         if (check(TokenType.dollar) && (prereq.data[$-1] == ')' || prereq.data[$-1] == '}'))
                             break;
+                        // Once any identifier has been merged after the $()
+                        // reference (e.g., /POTFILES.in after $(srcdir)),
+                        // subsequent tokens are new independent prereqs.
+                        if (mergedIdents)
+                            break;
                         if (check(TokenType.dollar))
                             prereq.data ~= accumulatePrereq();
                         else
+                        {
                             prereq.data ~= advance().value;
+                            mergedIdents = true;
+                        }
                     }
                 }
                 rule.children ~= prereq;
