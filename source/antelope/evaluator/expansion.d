@@ -224,11 +224,13 @@ private string resolveParenContent(string content, char closer, Environment* env
         content[colonIdx + 1] != '=' && indexOf(content[colonIdx + 1 .. $], '=') >= 0)
     {
         // Syntax: VAR:old=new
+        // Per GNU Make: $(var:a=b) ≡ $(patsubst %a,%b,$(var))
+        // The '%' is prepended so that patsubst matches at end-of-word.
         string varName = content[0 .. colonIdx];
         auto eqIdx = indexOf(content[colonIdx + 1 .. $], '=');
-        string oldPat = content[colonIdx + 1 .. colonIdx + 1 + eqIdx];
-        string newPat = content[colonIdx + 1 + eqIdx + 1 .. $];
-        // Equivalent to $(patsubst oldPat,newPat,$(varName))
+        string oldPat = "%" ~ content[colonIdx + 1 .. colonIdx + 1 + eqIdx];
+        string newPat = "%" ~ content[colonIdx + 1 + eqIdx + 1 .. $];
+        // Equivalent to $(patsubst %oldPat,%newPat,$(varName))
         string varValue = env ? env.get(varName) : "";
         if (varValue.length > 0)
         {
