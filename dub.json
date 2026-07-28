@@ -1,0 +1,9 @@
+{
+	"description": "A full replacement for GNU Make, with compatability in the 99th percentile. Written in D. Fuck you GNU.",
+	"license": "BSD-3-Clause",
+	"authors": [
+		"Specter"
+	],
+	"copyright": "Copyright (c) 2026 Antelope Contributors",
+	"name": "antelope"
+}
