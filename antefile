@@ -29,7 +29,7 @@ test:
 	dub test
 
 clean:
-	rm -f $(OUT) *.o
+	rm -f $(OUT)
 
 dist-clean: clean
 	rm -f antelope-*.tar.zst
