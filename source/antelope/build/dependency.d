@@ -1,9 +1,8 @@
 /// Dependency resolution and ordering logic.
 ///
 /// Uses Kahn's algorithm (BFS-based topological sort) to produce ordered
-/// build batches. Each batch contains targets that can be built in parallel.
-/// The first batch contains leaf targets (no unresolved prereqs in the
-/// graph), and the last batch contains the requested root target.
+/// build batches, plus critical-path weight computation for load-aware
+/// scheduling.
 module antelope.build.dependency;
 
 import antelope.build.graph;
@@ -152,6 +151,124 @@ Target[][] resolveDependencies(DependencyGraph graph, string target)
     return batches;
 }
 
+/// Compute critical-path weights for every target reachable from `root`.
+///
+/// The critical-path weight of a target is:
+///   weight = recipe.length + max(weight of each successor)
+///
+/// A "successor" is any target that depends on this target (i.e., a
+/// target listing this one as a prerequisite).  This is the reverse
+/// of the usual dependency direction — we compute from the root
+/// backward to the leaves.
+///
+/// Leaf nodes (targets with no in-graph dependents) have weight = recipe.length.
+/// Root nodes accumulate the full chain of work beneath them.
+///
+/// The resulting weights are written directly into each `Target.criticalWeight`
+/// field.  The caller sorts the ready queue by descending `criticalWeight`
+/// to prioritize targets on the critical path.
+///
+/// Params:
+///   graph = The dependency graph with reverse edges already populated
+///           via `DependencyGraph.buildReverseEdges()`.
+///   root  = The root target name to start the weight computation from.
+void computeCriticalWeights(ref DependencyGraph graph, string root)
+{
+    import std.algorithm : max;
+
+    // Only consider targets reachable from the root.
+    bool[string] reachable;
+    {
+        string[] stack = [root];
+        while (stack.length > 0)
+        {
+            string current = stack[$ - 1];
+            stack = stack[0 .. $ - 1];
+            if (current in reachable)
+                continue;
+            reachable[current] = true;
+            auto tp = graph.findTarget(current);
+            if (tp is null)
+                continue;
+            foreach (dep; tp.prerequisites ~ tp.orderOnlyPrereqs)
+                if (graph.hasTarget(dep) && dep !in reachable)
+                    stack ~= dep;
+        }
+    }
+
+    // Build a dependency map: node → all in-graph prereqs
+    string[][string] prereqMap;
+    foreach (ref t; graph.targets)
+    {
+        if (t.name !in reachable)
+            continue;
+        foreach (p; t.prerequisites ~ t.orderOnlyPrereqs)
+            if (p in reachable && graph.hasTarget(p))
+                prereqMap[t.name] ~= p;
+    }
+
+    // Kahn-style topological order from leaves (in-degree 0) to root.
+    size_t[string] inDegree;
+    string[][string] dependentsMap; // prereq → dependents
+
+    foreach (name; reachable.keys)
+        inDegree[name] = 0;
+
+    foreach (name, prereqs; prereqMap)
+    {
+        inDegree[name] = prereqs.length;
+        foreach (p; prereqs)
+            dependentsMap[p] ~= name;
+    }
+
+    // Process in topological order: all of a node's prereqs are
+    // processed before the node itself, so their weights are finalised.
+    string[] queue;
+    foreach (name; reachable.keys)
+        if (inDegree[name] == 0)
+            queue ~= name;
+
+    string[] order;
+    while (queue.length > 0)
+    {
+        string current = queue[$ - 1];
+        queue = queue[0 .. $ - 1];
+        order ~= current;
+
+        auto deps = current in dependentsMap;
+        if (deps is null)
+            continue;
+        foreach (dep; *deps)
+        {
+            inDegree[dep]--;
+            if (inDegree[dep] == 0)
+                queue ~= dep;
+        }
+    }
+
+    // Now compute weights in topological order.
+    // order[0] = leaf, order[$-1] = root.
+    foreach (name; order)
+    {
+        auto tp = graph.findTarget(name);
+        if (tp is null)
+            continue;
+
+        size_t maxPrereqWeight = 0;
+        auto prereqs = name in prereqMap;
+        if (prereqs)
+        {
+            foreach (p; *prereqs)
+            {
+                auto pp = graph.findTarget(p);
+                if (pp !is null)
+                    maxPrereqWeight = max(maxPrereqWeight, pp.criticalWeight);
+            }
+        }
+        tp.criticalWeight = tp.recipe.length + maxPrereqWeight;
+    }
+}
+
 ///
 unittest
 {
@@ -210,4 +327,52 @@ unittest
     assert(batches[0][0].name == "main.o");
     assert(batches[1].length == 1);
     assert(batches[1][0].name == "program");
+}
+
+/// Critical path weights: program(1) → main.o(1) → main.c(0) = 2
+unittest
+{
+    DependencyGraph g;
+    g.addTarget(Target("main.c", TargetKind.file, [], []));
+    g.addTarget(Target("main.o", TargetKind.file, ["main.c"],
+        ["gcc -c main.c"]));
+    g.addTarget(Target("program", TargetKind.file, ["main.o"],
+        ["gcc -o program main.o"]));
+
+    g.buildReverseEdges();
+    computeCriticalWeights(g, "program");
+
+    // main.c: no recipe, no prereqs → weight 0
+    auto mc = g.findTarget("main.c");
+    assert(mc !is null);
+    assert(mc.criticalWeight == 0);
+
+    // main.o: 1 recipe line, prereq main.c (weight 0) → weight 1
+    auto mo = g.findTarget("main.o");
+    assert(mo !is null);
+    assert(mo.criticalWeight == 1);
+
+    // program: 1 recipe line, prereq main.o (weight 1) → weight 2
+    auto prog = g.findTarget("program");
+    assert(prog !is null);
+    assert(prog.criticalWeight == 2);
+}
+
+/// Diamond dependency: root → a, b → leaf. Weights should reflect
+/// that both branches are equal.
+unittest
+{
+    DependencyGraph g;
+    g.addTarget(Target("leaf", TargetKind.file, [], ["touch leaf"]));          // weight 1
+    g.addTarget(Target("a", TargetKind.file, ["leaf"], ["cp leaf a"]));        // weight 2
+    g.addTarget(Target("b", TargetKind.file, ["leaf"], ["cp leaf b"]));        // weight 2
+    g.addTarget(Target("root", TargetKind.file, ["a", "b"], ["cat a b"]));     // weight 3
+
+    g.buildReverseEdges();
+    computeCriticalWeights(g, "root");
+
+    assert(g.findTarget("leaf").criticalWeight == 1);
+    assert(g.findTarget("a").criticalWeight == 2);
+    assert(g.findTarget("b").criticalWeight == 2);
+    assert(g.findTarget("root").criticalWeight == 3);
 }

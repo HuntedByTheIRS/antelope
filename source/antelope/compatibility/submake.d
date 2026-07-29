@@ -14,7 +14,6 @@ module antelope.compatibility.submake;
 import antelope.cli.args;
 import std.conv : to;
 import std.string : strip;
-import std.string : strip;
 
 /// Sub-make communication options.
 struct SubMakeConfig
@@ -36,14 +35,30 @@ struct SubMakeConfig
 /// MAKEFLAGS environment variable for recursive $(MAKE) invocations.
 ///
 /// Serialized flags:
-///   -j<N>   — parallel job count (only when jobs > 1)
-///   -n       — dry run
-///   -P       — POSIX conformance mode
-///   -d       — debug output
-///   VAR=val  — command-line variable overrides
+///   -j<N>              — parallel job count (only when jobs > 1)
+///   -n                  — dry run
+///   -P                  — POSIX conformance mode
+///   -d                  — debug output
+///   --jobserver-auth=R,W — jobserver pipe file descriptors (when provided)
+///   VAR=val             — command-line variable overrides
 ///
 /// Returns: a space-delimited MAKEFLAGS string, or "" if no flags are active.
 string serializeMakeFlags(CliConfig config)
+{
+    return serializeMakeFlagsImpl(config, 0, 0);
+}
+
+/// Serialize MAKEFLAGS including jobserver pipe descriptors.
+///
+/// When `readFd` and `writeFd` are non-zero, appends
+/// `--jobserver-auth=<readFd>,<writeFd>` to the MAKEFLAGS string
+/// so sub-make processes can participate in the shared job pool.
+string serializeMakeFlags(CliConfig config, int readFd, int writeFd)
+{
+    return serializeMakeFlagsImpl(config, readFd, writeFd);
+}
+
+private string serializeMakeFlagsImpl(CliConfig config, int readFd, int writeFd)
 {
     string flags;
 
@@ -59,5 +74,14 @@ string serializeMakeFlags(CliConfig config)
         flags ~= " -P";
     if (config.debugMode)
         flags ~= " -d";
+
+    // Jobserver pipe file descriptors for recursive make coordination.
+    // Only included when the pool has created a jobserver pipe.
+    if (readFd > 0 && writeFd > 0)
+    {
+        import std.conv : to;
+        flags ~= " --jobserver-auth=" ~ readFd.to!string ~ "," ~ writeFd.to!string;
+    }
+
     return flags.strip;
 }

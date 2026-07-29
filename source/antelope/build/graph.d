@@ -57,6 +57,12 @@ struct DependencyGraph
         // .PHONY handling: mark its prerequisites as phony targets
         graph.handlePhony();
 
+        // .WAIT handling: split prerequisite groups with barriers
+        graph.handleWait();
+
+        // .JOBS handling: per-target job limits (native mode)
+        graph.handleJobs();
+
         // Cycle detection: DFS with three-color marking
         graph.detectCycles();
 
@@ -120,6 +126,9 @@ private:
         }
     }
 
+    // ── Public scheduling / special-target API ──────────────────────────
+public:
+
     /// Find the ".PHONY" target (if it exists) and mark all of its
     /// prerequisites as phony targets.
     void handlePhony()
@@ -135,6 +144,169 @@ private:
                 t.kind = TargetKind.phony;
             phonyTargets[name] = true;
         }
+    }
+
+    /// Process .WAIT special target: split prerequisite groups with barriers.
+    ///
+    /// Syntax: `target: group1 .WAIT group2`
+    /// → group1 completes first, then group2 starts.
+    /// Adds implicit dependencies: each group2 target depends on each group1 target.
+    void handleWait()
+    {
+        foreach (ref t; targets)
+        {
+            ptrdiff_t waitPos = -1;
+            foreach (i, p; t.prerequisites)
+            {
+                if (p == ".WAIT")
+                {
+                    waitPos = cast(ptrdiff_t) i;
+                    break;
+                }
+            }
+            if (waitPos < 0)
+                continue;
+
+            string[] group1 = t.prerequisites[0 .. cast(size_t) waitPos];
+            string[] group2 = t.prerequisites[cast(size_t) waitPos + 1 .. $];
+
+            // Remove .WAIT from prerequisites.
+            t.prerequisites = group1 ~ group2;
+
+            // Add implicit deps: each group2 target depends on group1 targets.
+            foreach (g2name; group2)
+            {
+                auto g2 = findTarget(g2name);
+                if (g2 is null)
+                    continue;
+                foreach (g1name; group1)
+                {
+                    bool alreadyDepends;
+                    foreach (p; g2.prerequisites)
+                        if (p == g1name) { alreadyDepends = true; break; }
+                    if (!alreadyDepends && g1name != g2.name)
+                        g2.prerequisites ~= g1name;
+                }
+            }
+        }
+    }
+
+    /// Process .JOBS special target (native mode).
+    ///
+    /// Syntax: `.JOBS: N target1 target2 ...`
+    /// Limits the named targets to at most N concurrent jobs.
+    void handleJobs()
+    {
+        import std.conv : to;
+
+        Target* jobsTarget = findTarget(".JOBS");
+        if (jobsTarget is null)
+            return;
+
+        if (jobsTarget.prerequisites.length < 2)
+            return;
+
+        size_t limit;
+        try
+        {
+            limit = jobsTarget.prerequisites[0].to!size_t;
+        }
+        catch (Exception)
+        {
+            return;
+        }
+
+        foreach (i, name; jobsTarget.prerequisites[1 .. $])
+        {
+            auto tp = findTarget(name);
+            if (tp !is null)
+                tp.jobLimit = limit;
+        }
+
+        jobsTarget.kind = TargetKind.phony;
+        phonyTargets[".JOBS"] = true;
+    }
+
+    /// Build reverse edges: populate `dependents` for each target.
+    /// For each target, scan all other targets' prerequisites and
+    /// add this target's name to the dependents list of each prereq.
+    void buildReverseEdges()
+    {
+        // Clear existing reverse edges.
+        foreach (ref t; targets)
+            t.dependents = [];
+
+        foreach (ref t; targets)
+        {
+            foreach (prereq; t.prerequisites ~ t.orderOnlyPrereqs)
+            {
+                auto tp = findTarget(prereq);
+                if (tp !is null)
+                    tp.dependents ~= t.name;
+            }
+        }
+    }
+
+    /// Reset all scheduling state to defaults.
+    /// NOTE: jobLimit is NOT reset — it is set by handleJobs() and persists
+    /// across builds.
+    void resetSchedulingState()
+    {
+        foreach (ref t; targets)
+        {
+            t.state = BuildState.pending;
+            t.remainingDeps = 0;
+            t.criticalWeight = 0;
+        }
+    }
+
+    /// Compute remaining in-graph prerequisite count for each target.
+    /// Stores the count in each target's `remainingDeps` field.
+    /// Only counts prerequisites that exist as graph targets.
+    void computeRemainingDeps()
+    {
+        foreach (ref t; targets)
+        {
+            size_t count;
+            foreach (prereq; t.prerequisites ~ t.orderOnlyPrereqs)
+            {
+                if (hasTarget(prereq))
+                    count++;
+            }
+            t.remainingDeps = count;
+        }
+    }
+
+    /// Compute the transitive closure of a root target.
+    /// Returns all target names reachable from root (including root itself).
+    string[] transitiveClosure(string root)
+    {
+        bool[string] visited;
+        string[] stack = [root];
+        string[] result;
+
+        while (stack.length > 0)
+        {
+            string current = stack[$ - 1];
+            stack = stack[0 .. $ - 1];
+
+            if (current in visited)
+                continue;
+            visited[current] = true;
+            result ~= current;
+
+            auto tp = findTarget(current);
+            if (tp is null)
+                continue;
+
+            foreach (prereq; tp.prerequisites ~ tp.orderOnlyPrereqs)
+            {
+                if (hasTarget(prereq) && prereq !in visited)
+                    stack ~= prereq;
+            }
+        }
+
+        return result;
     }
 
     /// Detect cycles in the dependency graph using three-color DFS.

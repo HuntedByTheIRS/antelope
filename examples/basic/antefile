@@ -1,0 +1,20 @@
+# Basic Antelope build — native mode (explicit, no magic)
+#
+# Usage: antelope              (builds "all")
+#        antelope clean        (cleans build artifacts)
+
+CC = gcc
+CFLAGS = -Wall -O2
+
+all: hello
+
+hello: hello.o
+	$(CC) $(CFLAGS) -o hello hello.o
+
+hello.o: hello.c
+	$(CC) $(CFLAGS) -c hello.c
+
+.PHONY: clean
+
+clean:
+	rm -f hello hello.o

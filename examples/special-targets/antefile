@@ -1,0 +1,88 @@
+# .WAIT and .JOBS examples — native mode
+#
+# Usage:
+#   antelope                      Build all targets
+#   antelope -j4                  Build with 4 parallel jobs
+#   antelope clean                Clean build artifacts
+#
+# .WAIT splits prerequisites into sequential groups:
+#   target: group1 .WAIT group2
+#   → group1 completes first, then group2 starts
+#
+# .JOBS limits concurrency for named targets:
+#   .JOBS: N target1 target2 ...
+#   → target1 and target2 run at most N jobs concurrently
+
+# ── Example 1: .WAIT barrier ───────────────────────────────────────
+#
+#   pipeline: fetch .WAIT build .WAIT test
+#   → fetch runs, then build after fetch, then test after build
+#   Within each group, targets can run in parallel.
+
+pipeline: fetch build test
+	@echo "Pipeline complete"
+
+fetch:
+	@echo "Fetching dependencies..."
+	@sleep 0.2
+	@echo "Fetch done"
+
+build: compile_a compile_b
+	@echo "Build complete"
+
+compile_a:
+	@echo "Compiling module A..."
+	@sleep 0.3
+	@echo "Module A done"
+
+compile_b:
+	@echo "Compiling module B..."
+	@sleep 0.3
+	@echo "Module B done"
+
+# .WAIT ensures test runs only after build completes
+test: build .WAIT
+	@echo "Running tests..."
+	@sleep 0.1
+	@echo "All tests passed"
+
+# ── Example 2: .JOBS throttle ──────────────────────────────────────
+#
+#   .JOBS: 2 heavy_a heavy_b heavy_c
+#   → Only 2 of {heavy_a, heavy_b, heavy_c} run concurrently
+#   Light targets (light_x, light_y) use the global -j limit.
+
+.JOBS: 2 heavy_a heavy_b heavy_c
+
+heavy_jobs: heavy_a heavy_b heavy_c light_x light_y
+	@echo "All heavy and light jobs done"
+
+heavy_a:
+	@echo "[heavy_a] starting..."
+	@sleep 0.5
+	@echo "[heavy_a] done"
+
+heavy_b:
+	@echo "[heavy_b] starting..."
+	@sleep 0.5
+	@echo "[heavy_b] done"
+
+heavy_c:
+	@echo "[heavy_c] starting..."
+	@sleep 0.5
+	@echo "[heavy_c] done"
+
+light_x:
+	@echo "[light_x] done instantly"
+
+light_y:
+	@echo "[light_y] done instantly"
+
+# ── Housekeeping ────────────────────────────────────────────────────
+
+.PHONY: pipeline fetch build compile_a compile_b test
+.PHONY: heavy_jobs heavy_a heavy_b heavy_c light_x light_y
+.PHONY: clean
+
+clean:
+	@echo "Cleaning..."

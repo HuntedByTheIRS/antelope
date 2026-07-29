@@ -29,6 +29,8 @@ int dispatchSubcommand(CliConfig config)
 /// Execute the build (default subcommand).
 ///
 /// Full pipeline: find build file → parse → evaluate → schedule → execute.
+/// The schedule/execute phases now use the parallel WorkerPool for
+/// dependency-aware concurrent builds when `-j > 1`.
 int runBuild(CliConfig config)
 {
     import antelope.parser.parser;
@@ -40,8 +42,12 @@ int runBuild(CliConfig config)
     import antelope.build.dependency;
     import antelope.build.scheduler;
     import antelope.build.executor;
+    import antelope.build.pool;
+    import antelope.build.output;
     import antelope.shell.environment;
     import antelope.filesystem.timestamps;
+    import antelope.compatibility.parallel;
+    import antelope.compatibility.submake;
 
     // Set log level
     if (config.debugMode)
@@ -104,10 +110,12 @@ int runBuild(CliConfig config)
 
     // Set MAKE to the antelope binary path for $(MAKE) in recipes.
     // Include -gnu so recursive sub-makes inherit GNU compat mode.
+    // config.file is shell-quoted to prevent injection when $(MAKE)
+    // is used in recipes.
     import std.file : thisExePath;
     string makeCmd = thisExePath();
     if (config.gnuMode) makeCmd ~= " -gnu";
-    if (config.file.length > 0) makeCmd ~= " -f " ~ config.file;
+    if (config.file.length > 0) makeCmd ~= " -f '" ~ escapeShell(config.file) ~ "'";
     env.set("MAKE", makeCmd);
 
     // Set MAKECMDGOALS from command-line targets (autotools compat)
@@ -171,7 +179,13 @@ int runBuild(CliConfig config)
         return 1;
     }
 
+    // Process special targets after evaluation populates the graph.
+    (*graph).handlePhony();
+    (*graph).handleWait();
+    (*graph).handleJobs();
+
     // Check for cycle errors
+    (*graph).detectCycles();
     if (graph.cycleErrors.length > 0)
     {
         foreach (err; graph.cycleErrors)
@@ -217,7 +231,7 @@ int runBuild(CliConfig config)
     else
         buildTargets = [graph.targets[0].name];
 
-    // .PHONY targets are tracked in the graph automatically via handlePhony()
+    // .PHONY + .WAIT + .JOBS targets are processed above via handlePhony/handleWait/handleJobs.
 
     // --- VPATH configuration (GNU Make compat) ---
     import antelope.compatibility.vpath;
@@ -252,16 +266,14 @@ int runBuild(CliConfig config)
         }
     }
 
-    // Build each requested target
-    int exitCode = 0;
+    // --- Resolve implicit targets (GNU Make compat) ---
+    // Targets requested on the command line might not exist in the graph
+    // yet — they may be defined only via pattern/suffix rules.
+    // We create stubs and run implicit rule resolution so they can be built.
     foreach (targetName; buildTargets)
     {
         if (!graph.hasTarget(targetName))
         {
-            // Target not explicitly defined — try to create it from
-            // implicit rules (suffix rules, pattern rules).  Autotools
-            // Makefiles invoke $(MAKE) with targets like "be.gmo" that
-            // are only defined via suffix rules (e.g., .po.gmo:).
             import antelope.build.target;
             Target stub;
             stub.name = targetName;
@@ -270,91 +282,105 @@ int runBuild(CliConfig config)
 
             import antelope.evaluator.evaluator : resolveImplicitRules;
             resolveImplicitRules(*graph, env);
-
-            if (!graph.hasTarget(targetName) ||
-                graph.findTarget(targetName).recipe.length == 0)
-            {
-                log(LogLevel.normal, "antelope: *** No rule to make target '" ~
-                    targetName ~ "'.  Stop.");
-                return 1;
-            }
         }
+    }
 
-        // Resolve dependencies and check what needs building
-        auto batches = resolveDependencies(*graph, targetName);
+    // --- Set up parallel execution config ---
+    ParallelConfig parallelCfg;
+    parallelCfg.jobs = config.jobs;
+    parallelCfg.heuristic = SchedulingHeuristic.criticalPath;
 
-        import std.stdio;
-        if (targetName == "libgnu.a" || targetName == "all") {
-            stderr.writefln("  batches=%d", batches.length);
-            foreach (i, batch; batches) {
-                size_t w;
-                foreach (ref t; batch) if (t.recipe.length > 0) w++;
-                stderr.writefln("    batch[%d]: %d targets, %d with recipe", i, batch.length, w);
-            }
-        }
-
-        bool builtSomething = false;
-        foreach (batch; batches)
+    // Check for .NOTPARALLEL targets in the graph.
+    if (graph.hasTarget(".NOTPARALLEL"))
+    {
+        auto np = graph.findTarget(".NOTPARALLEL");
+        if (np !is null)
         {
-            foreach (ref t; batch)
+            foreach (name; np.prerequisites)
+                parallelCfg.notParallelTargets ~= name;
+        }
+    }
+
+    // Output mode: buffer when parallel, live when serial.
+    auto outputMgr = new OutputManager();
+    if (config.jobs > 1 || config.jobs == 0)
+    {
+        outputMgr.buffered = true;
+        parallelCfg.outputSync = OutputSyncMode.target;
+    }
+
+    // --- Build base execution environment ---
+    string[] baseExecEnv;
+    if (env.hasKey("SHELL"))
+        baseExecEnv ~= "SHELL=" ~ env.get("SHELL");
+
+    // Create jobserver pipe for cross-process token coordination.
+    // Only created when parallel build is active (-j > 1).
+    // Create jobserver pipe for cross-process token coordination.
+    // Only created when parallel build is active (-j > 1).
+    import antelope.build.pool : WorkerPool;
+    WorkerPool.JobserverPipe jsPipe;
+    if (config.jobs > 1)
+        jsPipe = WorkerPool.createJobserverPipe(config.jobs);
+
+    // Serialize MAKEFLAGS for recursive $(MAKE) calls.
+    string makeFlags = serializeMakeFlags(config, jsPipe.readFd, jsPipe.writeFd);
+    if (makeFlags.length > 0)
+        baseExecEnv ~= "MAKEFLAGS=" ~ makeFlags;
+
+    // --- Variable expansion delegate ---
+    // Captured by the pool and called per-target during job construction.
+    // This delegates to the existing expand() function from the evaluator,
+    // threading through the global Environment and target context.
+    string expander(string line, string targetName,
+                    string[] prerequisites, string stem)
+    {
+        return expand(line, env, targetName, prerequisites, stem);
+    }
+
+    // --- Dispatch build ---
+    auto pool = WorkerPool.create(config.jobs);
+    int exitCode = pool.build(
+        *graph, buildTargets, parallelCfg, env,
+        &expander, &outputMgr, &vpath,
+        baseExecEnv, config.dryRun, false);
+
+    // Report up-to-date targets (tracks targets that had no work).
+    if (exitCode == 0)
+    {
+        bool anyBuilt;
+        foreach (targetName; buildTargets)
+        {
+            auto tp = graph.findTarget(targetName);
+            if (tp !is null && tp.state == BuildState.completed)
             {
-                if (!needsRebuild(t.name, t.prerequisites,
-                    &graph.phonyTargets, &vpath, &t.orderOnlyPrereqs))
-                    continue;
-
-                builtSomething = true;
-
-                // Execute recipe lines
-                foreach (recipeLine; t.recipe)
+                if (tp.recipe.length == 0 && !outputMgr.hasEchoed(targetName))
                 {
-                    // Expand variables in the recipe
-                    string expanded = expand(recipeLine, env, t.name,
-                        t.prerequisites, t.stem);
-
-                    // Print the command unless silent (@ prefix)
-                    import std.string : stripLeft;
-                    string trimmed = recipeLine.stripLeft();
-                    if (config.dryRun || config.debugMode || recipeLine.length == 0 ||
-                        (trimmed.length > 0 && trimmed[0] != '@'))
-                    {
-                        log(LogLevel.normal, expanded);
-                    }
-
-                    // Build environment for recipe execution
-                    // (propagate SHELL from Makefile if set)
-                    string[] execEnv;
-                    if (env.hasKey("SHELL"))
-                        execEnv ~= "SHELL=" ~ env.get("SHELL");
-
-                    // Serialize MAKEFLAGS for recursive $(MAKE) calls
-                    import antelope.compatibility.submake;
-                    string makeFlags = serializeMakeFlags(config);
-                    if (makeFlags.length > 0)
-                        execEnv ~= "MAKEFLAGS=" ~ makeFlags;
-
-                    // Execute unless dry run
-                    if (!config.dryRun)
-                    {
-                        auto result = execute(expanded, execEnv);
-                        if (!result.success)
-                        {
-                            log(LogLevel.normal, "antelope: *** [" ~ t.name ~
-                                "] Error " ~ result.exitCode.to!string);
-                            return result.exitCode;
-                        }
-                    }
+                    // Target was up-to-date or had no recipe.
                 }
+                else if (!outputMgr.hasEchoed(targetName))
+                {
+                    log(LogLevel.normal, "antelope: '" ~ targetName ~
+                        "' is up to date.");
+                }
+                anyBuilt = true;
             }
         }
-
-        if (!builtSomething)
+        if (!anyBuilt)
         {
-            log(LogLevel.normal, "antelope: '" ~ targetName ~
-                "' is up to date.");
+            // Check if nothing needed building (all targets already up to date).
         }
     }
 
     return exitCode;
+}
+
+/// Escape a string for single-quoted shell usage.
+/// Replaces each `'` with `'\''` so the value can be wrapped in single quotes.
+private string escapeShell(string s)
+{
+    import std.array : replace;
+    return s.replace("'", "'\\''");
 }
 
 /// Find which build file to use based on mode and config.
