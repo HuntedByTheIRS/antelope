@@ -1,0 +1,35 @@
+# Antefile — builds Antelope itself.
+
+OUT := antelope
+
+all: debug
+	@echo "→ antelope built (debug)"
+
+debug:
+	dub build
+
+release:
+	dub build --compiler=ldc2
+	strip $(OUT)
+	@echo "→ antelope built (release, ldc2, stripped)"
+
+dist: release
+	@tag=$$(git describe --tags --always 2>/dev/null || echo "dev"); \
+	date=$$(date +%Y%m%d); \
+	commit=$$(git rev-parse --short HEAD); \
+	name="antelope-$${tag}-$${date}-$${commit}"; \
+	mkdir -p "$$name"; \
+	cp $(OUT) "$$name/"; \
+	cp README.md LICENSE antefile "$$name/"; \
+	tar -cf - "$$name" | zstd -T0 -o "$$name.tar.zst"; \
+	rm -rf "$$name"; \
+	echo "→ $$name.tar.zst"
+
+test:
+	dub test
+
+clean:
+	rm -f $(OUT) *.o
+
+dist-clean: clean
+	rm -f antelope-*.tar.zst
